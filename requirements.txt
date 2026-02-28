@@ -4,3 +4,4 @@ tqdm
 soundfile
 librosa
 python-dotenv
+huggingface_hub
