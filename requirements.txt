@@ -1,0 +1,6 @@
+datasets==2.21.0
+mistralai
+tqdm
+soundfile
+librosa
+python-dotenv
