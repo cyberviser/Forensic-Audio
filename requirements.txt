@@ -5,3 +5,13 @@ soundfile
 librosa
 python-dotenv
 huggingface_hub
+# training
+torch
+transformers
+peft
+trl
+accelerate
+wandb
+trl-jobs
+mistral-common
+torchcodec
