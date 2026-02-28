@@ -42,8 +42,8 @@ def get_forensic_insight(transcript, emotion, scene_label):
         return f"Analysis unavailable due to error: {e}"
 
 # 3. GENERATION LOOP
-OUTPUT_FILE = "voxtral_forensic_train.jsonl"
-NUM_SAMPLES = 500  # Perfect size for 4B fine-tuning in a short hackathon
+OUTPUT_FILE = "voxtral_forensic_train_large.jsonl"
+NUM_SAMPLES = 12500  # Perfect size for 4B fine-tuning in a short hackathon
 
 print(f"Generating {NUM_SAMPLES} samples...")
 with open(OUTPUT_FILE, "w") as f:

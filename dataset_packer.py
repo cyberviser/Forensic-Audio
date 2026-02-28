@@ -15,7 +15,7 @@ if not HF_TOKEN:
 login(token=HF_TOKEN)
 
 # 1. PATHS
-INPUT_JSONL = "voxtral_forensic_train.jsonl"
+INPUT_JSONL = "voxtral_forensic_train_large.jsonl"
 OUTPUT_HF_REPO = "trishtan/voxtral-forensic-ds"
 
 # 2. LOAD ANNOTATIONS from JSONL into a dict keyed by audio path
