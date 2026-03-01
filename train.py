@@ -19,6 +19,7 @@ Full fine-tune (no LoRA) on an A100.
 # ]
 # ///
 
+import base64
 import io
 import os
 from dataclasses import dataclass
@@ -29,8 +30,12 @@ import numpy as np
 import soundfile as sf
 import torch
 import datasets
-from datasets import Features, Sequence, Value, load_dataset
-from transformers import AutoProcessor, TrainerCallback, VoxtralRealtimeForConditionalGeneration
+from datasets import load_dataset
+from transformers import (
+    AutoProcessor,
+    TrainerCallback,
+    VoxtralRealtimeForConditionalGeneration,
+)
 from trl import SFTConfig, SFTTrainer
 
 try:
@@ -44,25 +49,19 @@ WANDB_KEY         = os.getenv("WANDB_API_KEY")
 MODEL_NAME        = "mistralai/Voxtral-Mini-4B-Realtime-2602"
 DATASET           = "trishtan/voxtral-forensic-ds"
 OUTPUT_DIR        = "trishtan/voxtral-sentinel-4b"
-DATASET_REPO      = "trishtan/voxtral-forensic-ds-splits"
 SAMPLE_RATE       = 16000
-MAX_TEXT_TOKENS   = 512
 MEL_FRAMES        = 1500
 HOP_LENGTH        = 160
 AUDIO_MAX_SAMPLES = MEL_FRAMES * HOP_LENGTH  # 240000 = 15 seconds
+MAX_NEW_TOKENS    = 512
 
-# WandB setup — init before Trainer so we own the run lifecycle
-# and wandb.finish() cleanly closes it (prevents "crashed" status)
 if WANDB_KEY:
     import wandb
     os.environ["WANDB_PROJECT"]      = "voxtral-sentinel"
     os.environ["WANDB_RESUME"]       = "allow"
     os.environ["WANDB_HTTP_TIMEOUT"] = "300"
     wandb.login(key=WANDB_KEY)
-    wandb.init(
-        project="voxtral-sentinel",
-        resume="allow",
-    )
+    wandb.init(project="voxtral-sentinel", resume="allow")
 
 
 # =============================================================================
@@ -79,7 +78,7 @@ model.config.use_cache = False
 
 
 # =============================================================================
-# 2. Audio helper
+# 2. Audio helpers
 # =============================================================================
 def _pad_or_trim(audio: np.ndarray) -> np.ndarray:
     n = len(audio)
@@ -90,59 +89,69 @@ def _pad_or_trim(audio: np.ndarray) -> np.ndarray:
     return audio
 
 
+def _audio_entry_to_array(entry) -> np.ndarray:
+    """
+    Convert a HuggingFace Audio column entry to a float32 numpy array at SAMPLE_RATE.
+    Handles both the decoded dict format {'array': ..., 'sampling_rate': ...}
+    and the raw bytes dict format {'bytes': ..., 'path': ...}.
+    """
+    if isinstance(entry, dict):
+        if "array" in entry:
+            # Standard HF decoded Audio format
+            audio = np.array(entry["array"], dtype=np.float32)
+            sr    = entry.get("sampling_rate", SAMPLE_RATE)
+        elif entry.get("bytes"):
+            audio, sr = sf.read(io.BytesIO(entry["bytes"]))
+            audio     = audio.astype(np.float32)
+        elif entry.get("path") and os.path.exists(entry["path"]):
+            audio, sr = sf.read(entry["path"])
+            audio     = audio.astype(np.float32)
+        else:
+            raise ValueError(f"No usable audio in entry: {list(entry.keys())}")
+    else:
+        raise ValueError(f"Unexpected audio entry type: {type(entry)}")
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sr != SAMPLE_RATE:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+    return _pad_or_trim(audio)
+
+
+def _array_to_base64_wav(audio: np.ndarray) -> str:
+    """Encode a float32 numpy array as a base64 WAV string for apply_chat_template."""
+    buf = io.BytesIO()
+    sf.write(buf, audio, SAMPLE_RATE, format="WAV")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
 # =============================================================================
 # 3. Dataset
 # =============================================================================
 print("Loading dataset...")
-ds = load_dataset(DATASET, token=HF_TOKEN, split="train")
+# Dataset has columns: audio (Audio), prompt (string), answer (string)
+# prompt = "Analyze this recording for forensic indicators."
+# answer = "### TRANSCRIPT:\n...\n### ANALYSIS:\n...\n### CONCLUSION:\n..."
+ds = load_dataset(DATASET, token=HF_TOKEN)
 
-# Cast Audio() away before any iteration to avoid torchcodec import
-new_features = {}
-for col, feat in ds.features.items():
-    if isinstance(feat, datasets.Audio):
-        new_features[col] = {"bytes": Value("binary"), "path": Value("string")}
-    else:
-        new_features[col] = feat
-ds = ds.cast(Features(new_features))
+# Disable Audio decoding to avoid torchcodec dependency.
+# Audio stays as a raw {"bytes": ..., "path": ...} dict;
+# _audio_entry_to_array() in the collator decodes it via soundfile.
+ds = datasets.DatasetDict({
+    split: ds[split].cast_column("audio", datasets.Audio(decode=False))
+    for split in ds
+})
 
+# Use existing train/test splits if present, otherwise create them
+if "train" in ds and "test" in ds:
+    train_ds = ds["train"]
+    eval_ds  = ds["test"]
+else:
+    split    = ds["train"].train_test_split(test_size=0.05, seed=42)
+    train_ds = split["train"]
+    eval_ds  = split["test"]
 
-def process_audio_and_text(example):
-    entry = example["audio"]
-    if entry.get("bytes"):
-        audio, sr = sf.read(io.BytesIO(entry["bytes"]))
-    elif entry.get("path") and os.path.exists(entry["path"]):
-        audio, sr = sf.read(entry["path"])
-    else:
-        raise ValueError(f"No usable audio. Keys: {list(entry.keys())}")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    audio = audio.astype(np.float32)
-    if sr != SAMPLE_RATE:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-    return {
-        "text":  f"[INST] {example['prompt']} [/INST] {example['answer']}",
-        "audio": _pad_or_trim(audio).tolist(),
-    }
-
-
-print("Processing dataset...")
-ds = ds.map(process_audio_and_text, remove_columns=ds.column_names)
-ds = ds.cast(Features({
-    "text":  Value("string"),
-    "audio": Sequence(Value("float32")),
-}))
-
-# 90/10 train/eval split — fixed seed for reproducibility
-split    = ds.train_test_split(test_size=0.1, seed=42)
-train_ds = split["train"]
-eval_ds  = split["test"]
-print(f"Train: {len(train_ds)} examples, Eval: {len(eval_ds)} examples")
-
-# Export splits to Hub for benchmarking base vs fine-tuned model
-print("Pushing train/eval splits to Hub...")
-train_ds.push_to_hub(DATASET_REPO, split="train", token=HF_TOKEN, private=True)
-eval_ds.push_to_hub(DATASET_REPO, split="test",  token=HF_TOKEN, private=True)
-print(f"Splits at: https://huggingface.co/datasets/{DATASET_REPO}")
+print(f"Train: {len(train_ds)} | Eval: {len(eval_ds)}")
 
 
 # =============================================================================
@@ -150,36 +159,114 @@ print(f"Splits at: https://huggingface.co/datasets/{DATASET_REPO}")
 # =============================================================================
 @dataclass
 class VoxtralDataCollator:
+    """
+    Builds batches using apply_chat_template so audio and text are properly
+    interleaved in the model's expected format.
+
+    Each example is formatted as:
+        User:      [audio] + "Analyze this recording for forensic indicators."
+        Assistant: "### TRANSCRIPT:...\n### ANALYSIS:...\n### CONCLUSION:..."
+
+    Labels are masked on the user turn so loss is only computed on the
+    assistant response — this is critical for correct fine-tuning.
+    """
     processor: Any
-    max_text_tokens: int = MAX_TEXT_TOKENS
-    max_mel_frames:  int = MEL_FRAMES
 
-    def __call__(self, examples):
-        texts  = [ex["text"] for ex in examples]
-        audios = [_pad_or_trim(np.array(ex["audio"], dtype=np.float32)) for ex in examples]
+    def _build_messages(self, audio_b64: str, prompt: str, answer: str) -> list:
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": audio_b64, "format": "wav"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": answer,
+            },
+        ]
 
-        audio_batch = self.processor.feature_extractor(
-            audios,
+    def _mask_user_turn(self, input_ids: list, answer: str) -> list:
+        """
+        Return labels where the user turn tokens are replaced with -100.
+        Loss is only computed on the assistant response tokens.
+        """
+        # Tokenize just the answer to find its length
+        answer_ids = self.processor.tokenizer(
+            answer, add_special_tokens=False
+        )["input_ids"]
+        answer_len = len(answer_ids)
+
+        labels = list(input_ids)
+        # Mask everything except the last answer_len tokens
+        # (the EOS token after the answer should also be predicted)
+        mask_len = max(0, len(labels) - answer_len - 1)
+        for i in range(mask_len):
+            labels[i] = -100
+        return labels
+
+    def __call__(self, examples: list[dict]) -> dict:
+        all_input_ids      = []
+        all_attention_mask = []
+        all_labels         = []
+        all_audio_arrays   = []
+
+        for ex in examples:
+            audio_array = _audio_entry_to_array(ex["audio"])
+            audio_b64   = _array_to_base64_wav(audio_array)
+            messages    = self._build_messages(audio_b64, ex["prompt"], ex["answer"])
+
+            # apply_chat_template returns raw lists when audio is present
+            tokenized = self.processor.tokenizer.apply_chat_template(
+                messages,
+                return_tensors=None,
+                return_dict=True,
+            )
+
+            labels = self._mask_user_turn(tokenized["input_ids"], ex["answer"])
+
+            all_input_ids.append(tokenized["input_ids"])
+            all_attention_mask.append(tokenized["attention_mask"])
+            all_labels.append(labels)
+
+            # audio is a list of numpy arrays from apply_chat_template
+            raw_audio = tokenized.get("audio", [audio_array])
+            all_audio_arrays.append(raw_audio[0] if raw_audio else audio_array)
+
+        # Pad text sequences to the longest in the batch
+        max_len = max(len(ids) for ids in all_input_ids)
+        pad_id  = self.processor.tokenizer.pad_token_id or 0
+
+        padded_input_ids = []
+        padded_attn_mask = []
+        padded_labels    = []
+
+        for ids, mask, labs in zip(all_input_ids, all_attention_mask, all_labels):
+            pad = max_len - len(ids)
+            padded_input_ids.append(ids + [pad_id] * pad)
+            padded_attn_mask.append(mask + [0] * pad)
+            padded_labels.append(labs + [-100] * pad)
+
+        # Build audio input_features via feature_extractor
+        input_features = self.processor.feature_extractor(
+            all_audio_arrays,
             sampling_rate=SAMPLE_RATE,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.max_mel_frames,
-        )
-        text_batch = self.processor.tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_text_tokens,
-        )
+            max_length=MEL_FRAMES,
+        )["input_features"]
 
-        batch = {**audio_batch, **text_batch}
-        batch["labels"] = batch["input_ids"].clone()
-        pad_id = self.processor.tokenizer.pad_token_id
-        if pad_id is not None:
-            batch["labels"][batch["labels"] == pad_id] = -100
-        return batch
+        return {
+            "input_ids":      torch.tensor(padded_input_ids,  dtype=torch.long),
+            "attention_mask": torch.tensor(padded_attn_mask,  dtype=torch.long),
+            "labels":         torch.tensor(padded_labels,     dtype=torch.long),
+            "input_features": input_features.to(torch.bfloat16),
+        }
 
 
 collator = VoxtralDataCollator(processor=processor)
@@ -217,14 +304,15 @@ training_args = SFTConfig(
     logging_steps=10,
     eval_strategy="steps",
     eval_steps=100,
-    save_strategy="no",            # no intermediate saves — push once at end
-    load_best_model_at_end=False,  # requires matching save_strategy, disabled
+    save_strategy="no",
+    load_best_model_at_end=False,
     report_to="wandb" if WANDB_KEY else "none",
-    push_to_hub=False,             # single push at end instead
+    push_to_hub=False,
     hub_model_id=OUTPUT_DIR,
     hub_token=HF_TOKEN,
+    # These tell SFTTrainer not to do its own tokenization —
+    # our collator handles everything
     dataset_text_field="",
-    max_length=MAX_TEXT_TOKENS,
     dataset_kwargs={"skip_prepare_dataset": True},
     remove_unused_columns=False,
 )
@@ -246,12 +334,10 @@ trainer = SFTTrainer(
 print("Starting training...")
 trainer.train()
 
-# Single save and push at end
 print("Saving and pushing model to Hub...")
 trainer.save_model(OUTPUT_DIR)
 trainer.push_to_hub()
 print(f"\nDone! Model at: https://huggingface.co/{OUTPUT_DIR}")
 
-# Cleanly close WandB — prevents "crashed" status on HF job instances
 if WANDB_KEY:
     wandb.finish()
