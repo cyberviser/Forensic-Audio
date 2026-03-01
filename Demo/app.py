@@ -206,39 +206,68 @@ def _load_audio(path: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Audio → base64 WAV helper (required by apply_chat_template)
+# ---------------------------------------------------------------------------
+def _array_to_base64_wav(audio: np.ndarray) -> str:
+    import io as _io, base64 as _b64
+    buf = _io.BytesIO()
+    sf.write(buf, audio, SAMPLE_RATE, format="WAV")
+    return _b64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Voxtral inference
 # ---------------------------------------------------------------------------
 def _run_voxtral(audio_path: str, model_id: str) -> dict:
     processor, model = _load_voxtral(model_id)
-    audio = _load_audio(audio_path)
+    audio    = _load_audio(audio_path)
+    audio_b64 = _array_to_base64_wav(audio)
 
-    audio_batch = processor.feature_extractor(
-        [audio],
+    # Build the chat message with interleaved audio + text prompt.
+    # This is the only inference path that works correctly — passing
+    # audio and text separately (old approach) misaligns the model inputs.
+    # For the base model, omit the text prompt — it was not trained on it
+    # and adding it causes noise. For the fine-tuned model, include it.
+    is_finetuned = model_id == FINETUNED_MODEL
+    content = [
+        {
+            "type": "input_audio",
+            "input_audio": {"data": audio_b64, "format": "wav"},
+        },
+    ]
+    if is_finetuned:
+        content.append({"type": "text", "text": VOXTRAL_PROMPT})
+
+    messages = [{"role": "user", "content": content}]
+
+    # apply_chat_template returns plain lists when audio is present
+    tokenized = processor.tokenizer.apply_chat_template(
+        messages,
+        return_tensors=None,
+        return_dict=True,
+    )
+
+    input_ids      = torch.tensor(tokenized["input_ids"]).unsqueeze(0).to(model.device)
+    attention_mask = torch.tensor(tokenized["attention_mask"]).unsqueeze(0).to(model.device)
+
+    # Process audio through feature_extractor separately
+    raw_audio      = tokenized.get("audio", [audio])
+    input_features = processor.feature_extractor(
+        raw_audio,
         sampling_rate=SAMPLE_RATE,
         return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=MEL_FRAMES,
-    )
-    text_batch = processor.tokenizer(
-        [f"[INST] {VOXTRAL_PROMPT} [/INST]"],
-        return_tensors="pt",
-        padding=True,
-    )
+    )["input_features"].to(model.device, dtype=model.dtype)
 
-    # Cast float tensors to the model dtype (bfloat16) to avoid type mismatch errors;
-    # integer tensors (input_ids, attention_mask) must stay as-is.
-    model_dtype = next(model.parameters()).dtype
-    inputs = {
-        k: v.to(model.device, dtype=model_dtype) if v.is_floating_point() else v.to(model.device)
-        for k, v in {**audio_batch, **text_batch}.items()
-    }
+    # Include num_delay_tokens — required by the model's forward pass
+    num_delay = getattr(processor.feature_extractor, "num_delay_tokens", 0)
 
     with torch.no_grad():
         output_ids = model.generate(
-            **inputs,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_features=input_features,
+            num_delay_tokens=torch.tensor([num_delay], device=model.device),
             max_new_tokens=512,
-            max_length=1024,  # prevent generation_config.max_length from overriding max_new_tokens
             do_sample=False,
         )
 
@@ -268,10 +297,9 @@ def _run_voxtral(audio_path: str, model_id: str) -> dict:
 # Mistral conversation
 # ---------------------------------------------------------------------------
 def _run_mistral(system_prompt: str, user_message: str, history: list) -> str:
+    # history is a list of {"role": ..., "content": ...} dicts (Gradio messages format)
     messages = [{"role": "system", "content": system_prompt}]
-    for human, assistant in history:
-        messages.append({"role": "user",      "content": human})
-        messages.append({"role": "assistant", "content": assistant})
+    messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
     response = mistral_client.chat.complete(
@@ -288,14 +316,14 @@ def _run_mistral(system_prompt: str, user_message: str, history: list) -> str:
 # ---------------------------------------------------------------------------
 def process_audio(audio_path, model_choice, persona_choice, chat_history):
     if audio_path is None:
-        yield chat_history, "⚠️ No audio provided — upload or record a clip first.", ""
+        yield chat_history, "⚠️ No audio provided — upload or record a clip first.", {}
         return
 
     persona       = PERSONAS[persona_choice]
     use_finetuned = model_choice == "Fine-tuned (Voxtral Sentinel)"
     model_id      = FINETUNED_MODEL if use_finetuned else BASE_MODEL
 
-    yield chat_history, "🎙️ Analysing audio...", ""
+    yield chat_history, "🎙️ Analysing audio...", {}
 
     result = _run_voxtral(audio_path, model_id)
 
@@ -316,7 +344,10 @@ def process_audio(audio_path, model_choice, persona_choice, chat_history):
         history       = chat_history,
     )
 
-    new_history = chat_history + [["🎤 [Audio message]", agent_response]]
+    new_history = chat_history + [
+        {"role": "user",      "content": "🎤 [Audio message]"},
+        {"role": "assistant", "content": agent_response},
+    ]
     yield new_history, analysis_display, result  # store full result dict for follow-up context
 
 
@@ -341,7 +372,10 @@ def continue_chat(user_message, chat_history, model_choice, persona_choice, last
     )
 
     response    = _run_mistral(system, user_message, chat_history)
-    new_history = chat_history + [[user_message, response]]
+    new_history = chat_history + [
+        {"role": "user",      "content": user_message},
+        {"role": "assistant", "content": response},
+    ]
     return new_history, ""
 
 
@@ -416,7 +450,7 @@ button.primary:hover { opacity: 0.85 !important; }
 footer { display: none !important; }
 """
 
-with gr.Blocks(title="Voxtral Sentinel") as demo:
+with gr.Blocks(title="Voxtral Sentinel", css=CSS) as demo:
 
     last_analysis = gr.State({})
 
@@ -489,6 +523,7 @@ with gr.Blocks(title="Voxtral Sentinel") as demo:
                 label="",
                 height=480,
                 show_label=False,
+                type="messages",
                 avatar_images=(
                     None,
                     "https://api.dicebear.com/7.x/bottts/svg?seed=sentinel&backgroundColor=00FF94",
@@ -557,4 +592,4 @@ with gr.Blocks(title="Voxtral Sentinel") as demo:
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True, css=CSS)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)

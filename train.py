@@ -97,7 +97,6 @@ def _audio_entry_to_array(entry) -> np.ndarray:
     """
     if isinstance(entry, dict):
         if "array" in entry:
-            # Standard HF decoded Audio format
             audio = np.array(entry["array"], dtype=np.float32)
             sr    = entry.get("sampling_rate", SAMPLE_RATE)
         elif entry.get("bytes"):
@@ -168,7 +167,7 @@ class VoxtralDataCollator:
         Assistant: "### TRANSCRIPT:...\n### ANALYSIS:...\n### CONCLUSION:..."
 
     Labels are masked on the user turn so loss is only computed on the
-    assistant response — this is critical for correct fine-tuning.
+    assistant response -- this is critical for correct fine-tuning.
     """
     processor: Any
 
@@ -194,37 +193,55 @@ class VoxtralDataCollator:
         """
         Return labels where the user turn tokens are replaced with -100.
         Loss is only computed on the assistant response tokens.
+
+        Scans input_ids from the right to find where the answer token sequence
+        begins, so masking is anchored on actual content rather than assumed
+        lengths. Robust to any special tokens apply_chat_template adds.
         """
-        # Tokenize just the answer to find its length
         answer_ids = self.processor.tokenizer(
             answer, add_special_tokens=False
         )["input_ids"]
         answer_len = len(answer_ids)
 
         labels = list(input_ids)
-        # Mask everything except the last answer_len tokens
-        # (the EOS token after the answer should also be predicted)
-        mask_len = max(0, len(labels) - answer_len - 1)
-        for i in range(mask_len):
+
+        first_answer_tok = answer_ids[0]
+        split_pos = None
+        for i in range(len(labels) - answer_len, -1, -1):
+            if labels[i] == first_answer_tok and labels[i:i + answer_len] == answer_ids:
+                split_pos = i
+                break
+
+        if split_pos is None:
+            # Fallback: mask everything except the last answer_len+1 tokens
+            split_pos = max(0, len(labels) - answer_len - 1)
+
+        for i in range(split_pos):
             labels[i] = -100
+
         return labels
 
     def __call__(self, examples: list[dict]) -> dict:
-        all_input_ids      = []
-        all_attention_mask = []
-        all_labels         = []
-        all_audio_arrays   = []
+        all_input_ids        = []
+        all_attention_mask   = []
+        all_labels           = []
+        all_audio_arrays     = []
+        all_num_delay_tokens = []
 
         for ex in examples:
             audio_array = _audio_entry_to_array(ex["audio"])
             audio_b64   = _array_to_base64_wav(audio_array)
             messages    = self._build_messages(audio_b64, ex["prompt"], ex["answer"])
 
-            # apply_chat_template returns raw lists when audio is present
+            # continue_final_message=True tells the tokenizer this conversation
+            # ends with an assistant turn (training completion), not a user turn
+            # (serving request). Without this flag mistral_common raises
+            # InvalidMessageStructureException.
             tokenized = self.processor.tokenizer.apply_chat_template(
                 messages,
                 return_tensors=None,
                 return_dict=True,
+                continue_final_message=True,
             )
 
             labels = self._mask_user_turn(tokenized["input_ids"], ex["answer"])
@@ -233,7 +250,12 @@ class VoxtralDataCollator:
             all_attention_mask.append(tokenized["attention_mask"])
             all_labels.append(labels)
 
-            # audio is a list of numpy arrays from apply_chat_template
+            # num_delay_tokens is a scalar the model uses internally for the
+            # streaming audio alignment -- must be included if present
+            if "num_delay_tokens" in tokenized:
+                all_num_delay_tokens.append(tokenized["num_delay_tokens"])
+
+            # audio is a list of numpy arrays returned by apply_chat_template
             raw_audio = tokenized.get("audio", [audio_array])
             all_audio_arrays.append(raw_audio[0] if raw_audio else audio_array)
 
@@ -261,15 +283,42 @@ class VoxtralDataCollator:
             max_length=MEL_FRAMES,
         )["input_features"]
 
-        return {
+        batch = {
             "input_ids":      torch.tensor(padded_input_ids,  dtype=torch.long),
             "attention_mask": torch.tensor(padded_attn_mask,  dtype=torch.long),
             "labels":         torch.tensor(padded_labels,     dtype=torch.long),
             "input_features": input_features.to(torch.bfloat16),
         }
 
+        # Include num_delay_tokens if the processor returned it
+        if all_num_delay_tokens:
+            batch["num_delay_tokens"] = torch.tensor(
+                all_num_delay_tokens, dtype=torch.long
+            )
+
+        return batch
+
 
 collator = VoxtralDataCollator(processor=processor)
+
+# Sanity-check the collator on one example before committing to a full run
+print("Running collator sanity check...")
+_sample_batch = collator([train_ds[0]])
+assert "input_ids"      in _sample_batch, "Missing input_ids"
+assert "input_features" in _sample_batch, "Missing input_features"
+assert "labels"         in _sample_batch, "Missing labels"
+_labels   = _sample_batch["labels"][0]
+_unmasked = (_labels != -100).sum().item()
+_total    = len(_labels)
+assert _unmasked > 0,      "All labels are masked -- masking logic is broken"
+assert _unmasked < _total, "No labels are masked -- user turn is included in loss"
+print(f"  input_ids shape     : {_sample_batch['input_ids'].shape}")
+print(f"  input_features shape: {_sample_batch['input_features'].shape}")
+print(f"  labels              : {_unmasked}/{_total} tokens unmasked (assistant only)")
+if "num_delay_tokens" in _sample_batch:
+    print(f"  num_delay_tokens    : {_sample_batch['num_delay_tokens']}")
+del _sample_batch
+print("Collator sanity check passed.")
 
 
 # =============================================================================
@@ -283,7 +332,7 @@ class LossThresholdCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         eval_loss = metrics.get("eval_loss")
         if eval_loss is not None and eval_loss < self.threshold:
-            print(f"\nEval loss {eval_loss:.4f} below threshold {self.threshold} — stopping.")
+            print(f"\nEval loss {eval_loss:.4f} below threshold {self.threshold} -- stopping.")
             control.should_training_stop = True
         return control
 
@@ -310,8 +359,6 @@ training_args = SFTConfig(
     push_to_hub=False,
     hub_model_id=OUTPUT_DIR,
     hub_token=HF_TOKEN,
-    # These tell SFTTrainer not to do its own tokenization —
-    # our collator handles everything
     dataset_text_field="",
     dataset_kwargs={"skip_prepare_dataset": True},
     remove_unused_columns=False,
@@ -341,3 +388,37 @@ print(f"\nDone! Model at: https://huggingface.co/{OUTPUT_DIR}")
 
 if WANDB_KEY:
     wandb.finish()
+
+# =============================================================================
+# INFERENCE NOTE
+# =============================================================================
+# At inference, pass audio + prompt via apply_chat_template (NOT audio-only).
+# The model learned: audio + prompt -> structured response.
+# Audio-only input will produce degenerate output.
+#
+#   import base64, io, soundfile as sf
+#   buf = io.BytesIO()
+#   sf.write(buf, audio_array, 16000, format="WAV")
+#   audio_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+#
+#   messages = [{
+#       "role": "user",
+#       "content": [
+#           {"type": "input_audio", "input_audio": {"data": audio_b64, "format": "wav"}},
+#           {"type": "text", "text": "Analyze this recording for forensic indicators."},
+#       ]
+#   }]
+#   tokenized = processor.tokenizer.apply_chat_template(
+#       messages, return_tensors=None, return_dict=True
+#   )
+#   input_ids      = torch.tensor(tokenized["input_ids"]).unsqueeze(0).to(model.device)
+#   attention_mask = torch.tensor(tokenized["attention_mask"]).unsqueeze(0).to(model.device)
+#   input_features = processor.feature_extractor(
+#       tokenized["audio"], sampling_rate=16000, return_tensors="pt"
+#   )["input_features"].to(model.device, dtype=model.dtype)
+#
+#   output_ids = model.generate(
+#       input_ids=input_ids, attention_mask=attention_mask,
+#       input_features=input_features, max_new_tokens=512, do_sample=False,
+#   )
+#   print(processor.tokenizer.decode(output_ids[0], skip_special_tokens=True))
