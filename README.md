@@ -180,10 +180,10 @@ print(processor.tokenizer.decode(output_ids[0], skip_special_tokens=True))
 
 | Metric | Value |
 |---|---|
-| Final eval loss | **1.144** |
-| Mean token accuracy | **74.25%** |
+| Final eval loss | **1.148** |
+| Mean token accuracy | **74.35%** |
 | Train/eval accuracy gap | ~0% |
-| Stopped at epoch | 1.33 (early stopping) |
+| Stopped at epoch | 2.75 (early stopping) |
 
 The near-zero train/eval gap indicates the model generalises well to unseen audio with no measurable overfitting.
 
@@ -199,6 +199,12 @@ The near-zero train/eval gap indicates the model generalises well to unseen audi
 | W&B run | [voxtral-sentinel](https://wandb.ai/s222458666/voxtral-sentinel/runs/o39i1rfw) |
 
 ---
+
+## Dataset Sample
+
+A sample of the training data is available in [`sample_data.jsonl`](./sample_data.jsonl).
+
+Full dataset: [trishtan/voxtral-forensic-ds](https://huggingface.co/datasets/trishtan/voxtral-forensic-ds)
 
 ## Data Attribution
 
