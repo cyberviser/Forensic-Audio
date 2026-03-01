@@ -52,8 +52,14 @@ AUDIO_MAX_SAMPLES = MEL_FRAMES * HOP_LENGTH  # 240000 = 15 seconds
 
 if WANDB_KEY:
     import wandb
+    os.environ["WANDB_PROJECT"]      = "voxtral-sentinel"
+    os.environ["WANDB_RESUME"]       = "allow"
+    os.environ["WANDB_HTTP_TIMEOUT"] = "300"
     wandb.login(key=WANDB_KEY)
-    os.environ["WANDB_PROJECT"] = "voxtral-sentinel"
+    wandb.init(
+        project="voxtral-sentinel",
+        resume="allow",
+    )
 
 
 # =============================================================================
@@ -194,14 +200,14 @@ training_args = SFTConfig(
     logging_steps=10,
     eval_strategy="steps",
     eval_steps=100,
-    save_strategy="steps",
-    save_steps=100,
+    save_strategy="no",
+    #save_steps=100,
     save_total_limit=3,
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,   # lower eval_loss is better
+    load_best_model_at_end=False,
+    #metric_for_best_model="eval_loss",
+    #greater_is_better=False,   # lower eval_loss is better
     report_to="wandb" if WANDB_KEY else "none",
-    push_to_hub=True,
+    push_to_hub=False,
     hub_model_id=OUTPUT_DIR,
     hub_token=HF_TOKEN,
     dataset_text_field="",
@@ -214,6 +220,19 @@ training_args = SFTConfig(
 # =============================================================================
 # 6. Trainer
 # =============================================================================
+from transformers import TrainerCallback
+
+class LossThresholdCallback(TrainerCallback):
+    def __init__(self, threshold: float):
+        self.threshold = threshold
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        eval_loss = metrics.get("eval_loss")
+        if eval_loss is not None and eval_loss < self.threshold:
+            print(f"\nEval loss {eval_loss:.4f} crossed threshold {self.threshold} — stopping training.")
+            control.should_training_stop = True
+        return control
+    
 trainer = SFTTrainer(
     model=model,
     args=training_args,
@@ -221,7 +240,7 @@ trainer = SFTTrainer(
     eval_dataset=eval_ds,
     data_collator=collator,
     processing_class=processor.tokenizer,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+    callbacks=[LossThresholdCallback(threshold=1.5)],
 )
 
 print("Starting training...")
@@ -230,3 +249,7 @@ trainer.train()
 print("Pushing best model to Hub...")
 trainer.push_to_hub()
 print(f"\nDone! Model at: https://huggingface.co/{OUTPUT_DIR}")
+
+if WANDB_KEY:
+    import wandb
+    wandb.finish()
