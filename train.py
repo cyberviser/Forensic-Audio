@@ -30,7 +30,7 @@ import soundfile as sf
 import torch
 import datasets
 from datasets import Features, Sequence, Value, load_dataset
-from transformers import AutoProcessor, VoxtralRealtimeForConditionalGeneration
+from transformers import AutoProcessor, EarlyStoppingCallback, VoxtralRealtimeForConditionalGeneration
 from trl import SFTConfig, SFTTrainer
 
 try:
@@ -129,6 +129,14 @@ train_ds = split["train"]
 eval_ds  = split["test"]
 print(f"Train: {len(train_ds)} examples, Eval: {len(eval_ds)} examples")
 
+# Export train/eval splits to Hub for benchmarking
+DATASET_REPO = "trishtan/voxtral-forensic-ds-splits"
+
+print("Pushing train/eval splits to Hub...")
+train_ds.push_to_hub(DATASET_REPO, split="train", token=HF_TOKEN, private=True)
+eval_ds.push_to_hub(DATASET_REPO, split="test", token=HF_TOKEN, private=True)
+print(f"Splits pushed to: https://huggingface.co/datasets/{DATASET_REPO}")
+
 
 # =============================================================================
 # 4. Data Collator
@@ -184,10 +192,13 @@ training_args = SFTConfig(
     max_grad_norm=1.0,
     bf16=True,
     logging_steps=10,
-    eval_strategy="epoch",
-    save_strategy="epoch",
+    eval_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
+    greater_is_better=False,   # lower eval_loss is better
     report_to="wandb" if WANDB_KEY else "none",
     push_to_hub=True,
     hub_model_id=OUTPUT_DIR,
@@ -209,6 +220,7 @@ trainer = SFTTrainer(
     eval_dataset=eval_ds,
     data_collator=collator,
     processing_class=processor.tokenizer,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
 )
 
 print("Starting training...")
